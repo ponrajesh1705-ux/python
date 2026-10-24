@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Glow Draw</title>
+<style>
+  :root { color-scheme: dark; --bg: #0e0a22; --fg: #f3efe6; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #box { position: relative; width: 10px; height: 10px; will-change: transform; }
+  #photo, #cv { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+  #cv { transition: opacity 1.6s ease; }
+  #photo { opacity: 0; }
+  #cap { position: absolute; left: 6%; right: 6%; bottom: 7%; text-align: center; font-size: clamp(18px, 4.6vw, 34px);
+    font-weight: 600; letter-spacing: .04em; color: #fff7e6; text-shadow: 0 2px 14px rgba(0,0,0,.65), 0 0 28px rgba(255,190,90,.55);
+    opacity: 0; transition: opacity 2s ease; pointer-events: none; }
+  #cap.show { opacity: 1; }
+  #msg { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); text-align: center;
+    padding: 0 24px; font-size: 16px; line-height: 1.5; letter-spacing: .02em; opacity: .85; }
+  #replay { position: absolute; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
+    transform: translateX(-50%); padding: 10px 22px; border-radius: 999px; border: 1px solid rgba(255,255,255,.35);
+    background: rgba(0,0,0,.45); color: var(--fg); font-size: 15px; cursor: pointer;
+    opacity: 0; pointer-events: none; transition: opacity .6s ease; backdrop-filter: blur(6px); }
+  #replay.show { opacity: 1; pointer-events: auto; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="box">
+    <img id="photo" alt="">
+    <canvas id="cv"></canvas>
+    <div id="cap"></div>
+  </div>
+  <div id="msg">Preparing…</div>
+  <button id="replay" type="button">Replay</button>
+</div>
+
+<script>
+/* =====================================================================
+   GLOW DRAW  -  a slow, cinematic reveal
+   Story:  quiet glowing night  ->  pens draw the world AROUND the person
+           ->  the face is drawn LAST  ->  a wave of golden light reveals the real photo.
+   Put this file (index.html) and your photo in the SAME folder.
+   The photo must be named  photo.jpg   (or change the name on the next line).
+   ===================================================================== */
+const PHOTO_SRC = "photo.jpg";
+
+/* ---------- settings you can change ---------- */
+const CAPTION = "";            // optional words at the end, for example "Happy Birthday!"  (empty = no text)
+const FACE_X = 0.50;           // where the face is, left to right (0 = left edge, 1 = right edge)
+const FACE_Y = 0.40;           // where the face is, top to bottom (0 = top, 1 = bottom)
+                               //   -> the face is drawn last and the light wave starts from here.
+const T_DRAW_START   = 1.8;    // seconds: the quiet intro ends, pens begin
+const T_DRAW_END     = 11.0;   // seconds: pens finish (the face is the very last)
+const T_REVEAL_START = 11.3;   // seconds: wave of light starts revealing the real photo
+const T_REVEAL_END   = 14.0;   // seconds: real photo fully revealed
+const T_GLOW_END     = 14.3;   // seconds: fade to the untouched original photo
+const MAX_LINES  = 900;        // how many lines the pens draw
+const MIN_LENGTH = 18;         // ignore tiny scratches shorter than this
+const PEN_SPEED  = 400;        // pen speed (pixels per second)
+const WORK_SIDE  = 960;        // working size of the drawing (smaller = faster on old phones)
+const PALETTE = [[255,193,64],[255,64,178],[166,77,255],[64,230,255]];   // gold, pink, violet, cyan (R,G,B)
+
+/* ---------- page elements ---------- */
+const box = document.getElementById("box"), photo = document.getElementById("photo");
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const msg = document.getElementById("msg"), replayBtn = document.getElementById("replay"), cap = document.getElementById("cap");
+
+let W = 0, H = 0, S = null, rafId = 0, startTime = 0;
+
+/* ---------- small helpers ---------- */
+function smooth(x) { x = Math.min(1, Math.max(0, x)); return x * x * (3 - 2 * x); }
+function mulberry(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function paletteColor(pos) {
+  pos = Math.min(0.9999, Math.max(0, pos)) * (PALETTE.length - 1);
+  const i = Math.floor(pos), f = pos - i, a = PALETTE[i], b = PALETTE[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+function makeCanvas(w, h) { const c = document.createElement("canvas"); c.width = Math.max(1, w | 0); c.height = Math.max(1, h | 0); return c; }
+function rgb(c, a) { return `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`; }
+
+/* keep the picture as big as possible without cropping */
+function fitBox() {
+  if (!photo.naturalWidth) return;
+  const s = Math.min(window.innerWidth / photo.naturalWidth, window.innerHeight / photo.naturalHeight);
+  box.style.width = Math.floor(photo.naturalWidth * s) + "px";
+  box.style.height = Math.floor(photo.naturalHeight * s) + "px";
+}
+window.addEventListener("resize", fitBox);
+
+/* ---------- STEP 1: find the outlines in the photo ---------- */
+function boxBlur(src, w, h, r) {            // fast blur (running sum), horizontal then vertical
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h), n = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    let sum = 0; const row = y * w;
+    for (let x = -r; x <= r; x++) sum += src[row + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = sum / n;
+      sum += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = -r; y <= r; y++) sum += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = sum / n;
+      sum += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+function findLines(img) {
+  const s = Math.min(1, WORK_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+  W = Math.round(img.naturalWidth * s); H = Math.round(img.naturalHeight * s);
+  const off = makeCanvas(W, H), octx = off.getContext("2d", { willReadFrequently: true });
+  octx.drawImage(img, 0, 0, W, H);
+  let data;
+  try { data = octx.getImageData(0, 0, W, H).data; }
+  catch (e) { throw new Error("SECURITY"); }
+
+  const N = W * H, gray = new Float32Array(N);
+  for (let i = 0, j = 0; i < N; i++, j += 4) gray[i] = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
+
+  // make local contrast even, so faces and soft details are found too
+  const g = boxBlur(boxBlur(gray, W, H, 1), W, H, 1);
+  const mean = boxBlur(boxBlur(gray, W, H, 14), W, H, 14);
+  const sq = new Float32Array(N); for (let i = 0; i < N; i++) sq[i] = gray[i] * gray[i];
+  const meanSq = boxBlur(boxBlur(sq, W, H, 14), W, H, 14);
+  const nrm = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const v = Math.max(0, meanSq[i] - mean[i] * mean[i]);
+    nrm[i] = (g[i] - mean[i]) / (Math.sqrt(v) + 10);
+  }
+
+  // Sobel edges + thin them (non-maximum suppression)
+  const mag = new Float32Array(N), dir = new Uint8Array(N);
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const i = y * W + x;
+    const gx = -nrm[i - W - 1] - 2 * nrm[i - 1] - nrm[i + W - 1] + nrm[i - W + 1] + 2 * nrm[i + 1] + nrm[i + W + 1];
+    const gy = -nrm[i - W - 1] - 2 * nrm[i - W] - nrm[i - W + 1] + nrm[i + W - 1] + 2 * nrm[i + W] + nrm[i + W + 1];
+    mag[i] = Math.hypot(gx, gy);
+    const ang = Math.atan2(gy, gx) * 180 / Math.PI, a = ang < 0 ? ang + 180 : ang;
+    dir[i] = (a < 22.5 || a >= 157.5) ? 0 : a < 67.5 ? 1 : a < 112.5 ? 2 : 3;
+  }
+  const ridge = new Float32Array(N), vals = [];
+  const off1 = [[1, 0, -1, 0], [1, 1, -1, -1], [0, 1, 0, -1], [-1, 1, 1, -1]];
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+    const i = y * W + x, m = mag[i]; if (m < 0.2) continue;
+    const o = off1[dir[i]];
+    if (m >= mag[(y + o[1]) * W + x + o[0]] && m >= mag[(y + o[3]) * W + x + o[2]]) { ridge[i] = m; vals.push(m); }
+  }
+  if (vals.length < 50) throw new Error("NOEDGES");
+  vals.sort((a, b) => a - b);
+  const lowT = vals[Math.floor(vals.length * 0.50)], highT = vals[Math.floor(vals.length * 0.82)];
+
+  // hysteresis: keep weak edges only when they touch a strong edge
+  const edge = new Uint8Array(N), stack = [];
+  for (let i = 0; i < N; i++) if (ridge[i] >= highT) { edge[i] = 1; stack.push(i); }
+  while (stack.length) {
+    const i = stack.pop(), x = i % W, y = (i / W) | 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const j = ny * W + nx; if (!edge[j] && ridge[j] >= lowT) { edge[j] = 1; stack.push(j); }
+    }
+  }
+
+  // walk along the edges to make pen lines
+  const vis = new Uint8Array(N), chains = [];
+  const DX = [1, 0, -1, 0, 1, -1, -1, 1], DY = [0, 1, 0, -1, 1, 1, -1, -1];
+  function nextPx(i) {
+    const x = i % W, y = (i / W) | 0;
+    for (let k = 0; k < 8; k++) {
+      const nx = x + DX[k], ny = y + DY[k]; if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const j = ny * W + nx; if (edge[j] && !vis[j]) return j;
+    }
+    return -1;
+  }
+  for (let i0 = 0; i0 < N; i0++) {
+    if (!edge[i0] || vis[i0]) continue;
+    vis[i0] = 1;
+    const fwd = [i0], back = [];
+    let cur = i0, n;
+    while ((n = nextPx(cur)) >= 0) { vis[n] = 1; fwd.push(n); cur = n; }
+    cur = i0;
+    while ((n = nextPx(cur)) >= 0) { vis[n] = 1; back.push(n); cur = n; }
+    const all = back.reverse().concat(fwd);
+    if (all.length >= MIN_LENGTH) chains.push(all);
+  }
+  chains.sort((a, b) => b.length - a.length);      // keep the longest lines
+  return chains.slice(0, MAX_LINES).map(c => {
+    const pts = []; for (let k = 0; k < c.length; k += 2) pts.push(c[k] % W, (c[k] / W) | 0);
+    if ((c.length - 1) % 2) pts.push(c[c.length - 1] % W, (c[c.length - 1] / W) | 0);
+    return pts;
+  });
+}
+
+/* ---------- STEP 2: prepare the animation ---------- */
+function buildScene(linesIn) {
+  const rnd = mulberry(11);
+  const fx = FACE_X * W, fy = FACE_Y * H;
+
+  // THE SECRET: lines far from the face are drawn first, lines near the face are drawn last.
+  const info = linesIn.map(p => {
+    let sx = 0, sy = 0; const k = p.length / 2;
+    for (let j = 0; j < p.length; j += 2) { sx += p[j]; sy += p[j + 1]; }
+    sx /= k; sy /= k;
+    return { p, sx, sy, d: Math.hypot(sx - fx, sy - fy) };
+  }).sort((a, b) => b.d - a.d);
+  const lines = info.map(o => o.p), n = lines.length;
+
+  const nPts = lines.map(p => p.length / 2);
+  const dur = nPts.map(k => Math.min(4.0, Math.max(0.6, (k * 2) / PEN_SPEED)));
+  const t0 = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    // starts slowly, then more and more pens join in
+    const frac = Math.min(1, Math.max(0, Math.pow(i / Math.max(1, n - 1), 0.85) + (rnd() - 0.5) * 0.03));
+    t0[i] = T_DRAW_START + frac * Math.max(0, T_DRAW_END - T_DRAW_START - dur[i]);
+    dur[i] = Math.min(dur[i], T_DRAW_END - t0[i]);
+  }
+  const cols = info.map(o => paletteColor(((1.1 * (o.sy / H) + 0.7 * (o.sx / W) + rnd() * 0.35) % 1)));
+  const parts = []; for (let i = 0; i < 130; i++) parts.push({
+    x: rnd() * W, y: rnd() * H, ph: rnd() * 6.28, vy: -(6 + rnd() * 24), z: 0.3 + rnd() * 0.7,
+    c: PALETTE[Math.floor(rnd() * 4)] });
+
+  // glow layers: each one is half the size of the one before (cheap blur that works in every browser)
+  const lineLayer = makeCanvas(W, H);
+  const glow = [2, 4, 8, 16].map(d => makeCanvas(W / d, H / d));
+  const tmp = makeCanvas(W, H);
+  const small = makeCanvas(W, H); small.getContext("2d").drawImage(photo, 0, 0, W, H);   // photo shrunk once
+  const vig = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.22, W / 2, H / 2, Math.max(W, H) * 0.75);
+  vig.addColorStop(0, "rgba(14,10,34,0)"); vig.addColorStop(1, "rgba(14,10,34,0.7)");
+
+  // two backdrops: a cold midnight one, and a warm golden one that slowly takes over at the reveal
+  function backdrop(stops, glowA, glowB) {
+    const c = makeCanvas(W, H), b = c.getContext("2d");
+    const lg = b.createLinearGradient(0, 0, 0, H);
+    stops.forEach(s => lg.addColorStop(s[0], s[1]));
+    b.fillStyle = lg; b.fillRect(0, 0, W, H);
+    const a = b.createRadialGradient(W * 0.5, H * 0.95, 0, W * 0.5, H * 0.95, H * 0.75);
+    a.addColorStop(0, glowA); a.addColorStop(1, "rgba(0,0,0,0)"); b.fillStyle = a; b.fillRect(0, 0, W, H);
+    const d = b.createRadialGradient(W * 0.15, H * 0.05, 0, W * 0.15, H * 0.05, H * 0.65);
+    d.addColorStop(0, glowB); d.addColorStop(1, "rgba(0,0,0,0)"); b.fillStyle = d; b.fillRect(0, 0, W, H);
+    return c;
+  }
+  const bgCool = backdrop([[0, "#0b2a4a"], [0.45, "#2b1a5c"], [0.8, "#5c2a66"], [1, "#8c3b4c"]], "rgba(255,160,90,0.30)", "rgba(90,210,255,0.30)");
+  const bgWarm = backdrop([[0, "#3b2a5e"], [0.45, "#7a3a6a"], [0.8, "#c25a52"], [1, "#f09a4a"]], "rgba(255,200,110,0.45)", "rgba(255,170,200,0.30)");
+  const bokeh = []; for (let i = 0; i < 16; i++) bokeh.push({
+    x: rnd() * W, y: rnd() * H, r: (0.05 + rnd() * 0.12) * Math.max(W, H), ph: rnd() * 6.28,
+    sp: 0.15 + rnd() * 0.3, c: PALETTE[Math.floor(rnd() * 4)] });
+
+  const rMax = Math.max(Math.hypot(fx, fy), Math.hypot(W - fx, fy), Math.hypot(fx, H - fy), Math.hypot(W - fx, H - fy)) * 1.08;
+  return { lines, n, nPts, dur, t0, cols, parts, lineLayer, glow, tmp, small, vig, bgCool, bgWarm, bokeh,
+           fx, fy, rMax, last: new Int32Array(n) };
+}
+
+/* ---------- STEP 3: draw every frame ---------- */
+function drawFrame(t) {
+  const wp = smooth((t - T_REVEAL_START) / (T_REVEAL_END - T_REVEAL_START));      // light wave 0 -> 1
+  const neonAmt = 1 - smooth((t - (T_REVEAL_START + 0.9)) / 2.2);                  // neon lines fade away
+  const warm = smooth((t - (T_DRAW_END - 3)) / 6.5);                               // night -> golden warmth
+  const intro = smooth(t / 2.0);                                                    // gentle fade-in from the dark
+  const lctx = S.lineLayer.getContext("2d");
+
+  // camera: a very slow zoom-out that settles at exactly 100% when the photo is revealed
+  box.style.transform = `scale(${1 + 0.06 * (1 - smooth(t / T_REVEAL_END))})`;
+
+  // move every pen forward and draw its new piece of line
+  lctx.lineCap = "round"; lctx.lineJoin = "round"; lctx.lineWidth = Math.max(1.2, W / 760);
+  const heads = [];
+  for (let i = 0; i < S.n; i++) {
+    if (t < S.t0[i]) continue;
+    const fr = Math.min(1, (t - S.t0[i]) / S.dur[i]);
+    const idx = Math.floor(fr * (S.nPts[i] - 1)), last = S.last[i], pts = S.lines[i];
+    if (idx > last) {
+      lctx.strokeStyle = rgb(S.cols[i], 1); lctx.beginPath(); lctx.moveTo(pts[last * 2], pts[last * 2 + 1]);
+      for (let k = last + 1; k <= idx; k++) lctx.lineTo(pts[k * 2], pts[k * 2 + 1]);
+      lctx.stroke(); S.last[i] = idx;
+    }
+    if (fr < 1) heads.push([pts[idx * 2], pts[idx * 2 + 1], S.cols[i]]);
+  }
+
+  // build the glow (blurry copies of the lines)
+  const g = S.glow;
+  g[0].getContext("2d").clearRect(0, 0, g[0].width, g[0].height); g[0].getContext("2d").drawImage(S.lineLayer, 0, 0, g[0].width, g[0].height);
+  for (let k = 1; k < g.length; k++) { const c = g[k].getContext("2d"); c.clearRect(0, 0, g[k].width, g[k].height); c.drawImage(g[k - 1], 0, 0, g[k].width, g[k].height); }
+
+  // ---- backdrop (cold night, slowly turning warm)
+  ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1; ctx.drawImage(S.bgCool, 0, 0);
+  if (warm > 0) { ctx.globalAlpha = warm; ctx.drawImage(S.bgWarm, 0, 0); ctx.globalAlpha = 1; }
+
+  // slow light beams from above + floating soft light circles
+  ctx.globalCompositeOperation = "lighter";
+  for (let k = 0; k < 3; k++) {
+    ctx.save(); ctx.translate(W * (0.25 + 0.25 * k), -H * 0.1); ctx.rotate(0.35 - 0.35 * k + 0.08 * Math.sin(t * 0.25 + k * 2));
+    const bw = W * (0.16 + 0.05 * k), lgb = ctx.createLinearGradient(0, 0, 0, H * 1.3);
+    lgb.addColorStop(0, "rgba(255,225,170,0.13)"); lgb.addColorStop(1, "rgba(255,225,170,0)");
+    ctx.globalAlpha = (0.8 + 0.2 * Math.sin(t * 0.6 + k)) * intro; ctx.fillStyle = lgb; ctx.fillRect(-bw / 2, 0, bw, H * 1.3); ctx.restore();
+  }
+  for (const o of S.bokeh) {
+    const ox = o.x + 22 * Math.sin(t * o.sp + o.ph), oy = o.y + 16 * Math.cos(t * o.sp * 0.8 + o.ph);
+    const gr = ctx.createRadialGradient(ox, oy, 0, ox, oy, o.r);
+    gr.addColorStop(0, rgb(o.c, 0.16)); gr.addColorStop(0.6, rgb(o.c, 0.05)); gr.addColorStop(1, rgb(o.c, 0));
+    ctx.globalAlpha = (0.6 + 0.4 * Math.sin(t * 0.7 + o.ph)) * intro; ctx.fillStyle = gr; ctx.fillRect(ox - o.r, oy - o.r, o.r * 2, o.r * 2);
+  }
+  ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1;
+
+  // ---- the real photo, revealed by a soft wave of light that grows from the face
+  if (wp > 0) {
+    if (wp >= 1) { ctx.drawImage(S.small, 0, 0); }
+    else {
+      const R = wp * S.rMax, F = Math.max(40, S.rMax * 0.16);
+      const tc = S.tmp.getContext("2d");
+      tc.globalCompositeOperation = "source-over"; tc.clearRect(0, 0, W, H); tc.drawImage(S.small, 0, 0);
+      const mk = tc.createRadialGradient(S.fx, S.fy, Math.max(0, R - F), S.fx, S.fy, R + 1);
+      mk.addColorStop(0, "rgba(0,0,0,1)"); mk.addColorStop(1, "rgba(0,0,0,0)");
+      tc.globalCompositeOperation = "destination-in"; tc.fillStyle = mk; tc.fillRect(0, 0, W, H);
+      tc.globalCompositeOperation = "source-over";
+      ctx.drawImage(S.tmp, 0, 0);
+    }
+  }
+
+  // ---- neon lines + glow (light adds on top)
+  ctx.globalCompositeOperation = "lighter";
+  const shimmer = 0.9 + 0.1 * Math.sin(t * 3), na = neonAmt * intro;
+  ctx.globalAlpha = na * shimmer * 0.9; ctx.drawImage(S.lineLayer, 0, 0);
+  ctx.globalAlpha = na * 0.45; ctx.drawImage(g[1], 0, 0, W, H);
+  ctx.globalAlpha = na * 0.60; ctx.drawImage(g[2], 0, 0, W, H);
+  ctx.globalAlpha = na * 0.70; ctx.drawImage(g[3], 0, 0, W, H);
+
+  // ---- golden ring of light at the edge of the wave
+  if (wp > 0 && wp < 1) {
+    const R = wp * S.rMax, F = Math.max(40, S.rMax * 0.16);
+    const rg = ctx.createRadialGradient(S.fx, S.fy, Math.max(0, R - F * 0.9), S.fx, S.fy, R + F * 0.4);
+    rg.addColorStop(0, "rgba(255,214,140,0)"); rg.addColorStop(0.62, "rgba(255,214,140,0.5)"); rg.addColorStop(1, "rgba(255,214,140,0)");
+    ctx.globalAlpha = smooth(wp * 8) * (1 - smooth((wp - 0.8) / 0.2)); ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+  }
+
+  // ---- glowing pen tips and floating sparkles
+  for (const h of heads) {
+    ctx.globalAlpha = intro;
+    ctx.fillStyle = rgb(h[2], 0.16); ctx.beginPath(); ctx.arc(h[0], h[1], 11, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = rgb(h[2], 0.5);  ctx.beginPath(); ctx.arc(h[0], h[1], 5, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = "#fff";          ctx.beginPath(); ctx.arc(h[0], h[1], 2, 0, 6.2832); ctx.fill();
+  }
+  const pa = smooth(t / 3) * (1 - 0.7 * wp);
+  for (const q of S.parts) {
+    const x = ((q.x + 14 * Math.sin(t * 0.6 + q.ph)) % W + W) % W, y = ((q.y + q.vy * t) % H + H) % H;
+    ctx.globalAlpha = q.z * (0.5 + 0.5 * Math.sin(t * 2 + q.ph * 3)) * pa;
+    ctx.fillStyle = rgb(q.c, 1); ctx.beginPath(); ctx.arc(x, y, q.z > 0.65 ? 2 : 1.2, 0, 6.2832); ctx.fill();
+  }
+
+  // ---- soft flash at the moment of reveal, dark edges while drawing, and the opening fade-in
+  ctx.globalAlpha = 1;
+  if (wp > 0 && wp < 1) { ctx.fillStyle = `rgba(255,236,205,${0.14 * Math.sin(Math.PI * wp)})`; ctx.fillRect(0, 0, W, H); }
+  ctx.globalCompositeOperation = "source-over";
+  if (wp < 1) { ctx.globalAlpha = 1 - wp; ctx.fillStyle = S.vig; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  if (intro < 1) { ctx.fillStyle = `rgba(14,10,34,${1 - intro})`; ctx.fillRect(0, 0, W, H); }
+}
+
+/* ---------- play / replay ---------- */
+function play() {
+  cancelAnimationFrame(rafId);
+  replayBtn.classList.remove("show"); cap.classList.remove("show");
+  photo.style.opacity = "0";
+  cv.style.transition = "none"; cv.style.opacity = "1"; void cv.offsetWidth; cv.style.transition = "";
+  for (const c of [S.lineLayer, ...S.glow]) c.getContext("2d").clearRect(0, 0, c.width, c.height);
+  S.last.fill(0);
+  startTime = performance.now();
+  let faded = false;
+  (function loop(now) {
+    const t = (now - startTime) / 1000;
+    drawFrame(Math.min(t, T_GLOW_END));
+    if (t >= T_GLOW_END && !faded) {          // hand over to the untouched original photo
+      faded = true; photo.style.opacity = "1"; cv.style.opacity = "0"; box.style.transform = "none";
+      if (CAPTION) { cap.textContent = CAPTION; setTimeout(() => cap.classList.add("show"), 900); }
+    }
+    if (t < T_GLOW_END + 1.8) rafId = requestAnimationFrame(loop);
+    else replayBtn.classList.add("show");
+  })(startTime);
+}
+replayBtn.addEventListener("click", play);
+
+/* ---------- start ---------- */
+function showError(html) { msg.innerHTML = html; msg.style.display = "block"; cv.style.display = "none"; }
+
+photo.onerror = () => showError("Couldn’t find <b>" + PHOTO_SRC + "</b>.<br>Put your photo in the same folder as index.html and name it exactly <b>" + PHOTO_SRC + "</b>.");
+photo.onload = () => {
+  fitBox();
+  setTimeout(() => {                         // small pause so “Preparing…” can show first
+    try {
+      const lines = findLines(photo);
+      cv.width = W; cv.height = H;
+      S = buildScene(lines);
+      msg.style.display = "none";
+      play();
+    } catch (e) {
+      if (e.message === "SECURITY") showError("Your browser blocked reading the photo when the page is opened as a file.<br>This works on GitHub Pages. To test it on your computer, use VS Code “Live Server”, or run <b>python -m http.server</b> in this folder.");
+      else if (e.message === "NOEDGES") showError("No outlines were found in this photo. Try a brighter, clearer photo.");
+      else showError("Something went wrong: " + e.message);
+    }
+  }, 60);
+};
+photo.src = PHOTO_SRC;
+</script>
+</body>
+</html>
